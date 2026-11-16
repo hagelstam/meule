@@ -1,0 +1,211 @@
+package store
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/hagelstam/meule/logging"
+)
+
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 120 * time.Second
+)
+
+type TLSConfig struct {
+	CertPath string
+	KeyPath  string
+}
+
+type HTTPService struct {
+	httpAddr  string
+	store     *Store
+	tlsConfig *TLSConfig
+}
+
+type ErrorResponse struct {
+	Error string `json:"error,omitempty"`
+}
+
+func NewHTTPService(httpAddr string, store *Store, tlsConfig *TLSConfig) (*HTTPService, error) {
+	return &HTTPService{
+		httpAddr:  httpAddr,
+		store:     store,
+		tlsConfig: tlsConfig,
+	}, nil
+}
+
+func (h *HTTPService) writeError(w http.ResponseWriter, statusCode int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+func (h *HTTPService) writeMsg(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": message,
+	})
+}
+
+func (h *HTTPService) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *HTTPService) Start() error {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /api/v1/create_logical", h.handleCreateLogicalVolume)
+	mux.HandleFunc("POST /api/v1/{logical_id}/{file_id}/create_file", h.handleCreateFile)
+	mux.HandleFunc("GET /api/v1/{logical_id}/{file_id}/read_file", h.handleReadFile)
+	mux.HandleFunc("GET /api/v1/logicals", h.handleGetLogicals)
+	mux.HandleFunc("GET /healthz", h.handleHealth)
+	mux.HandleFunc("GET /readyz", h.handleReady)
+
+	log.Printf("[INFO] store: starting HTTP API server on %s", h.httpAddr)
+	logger := logging.NewLogger()
+
+	server := &http.Server{
+		Addr:              h.httpAddr,
+		Handler:           logging.LoggingMiddleware(logger)(h.corsMiddleware(mux)),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+
+	if h.tlsConfig != nil {
+		return server.ListenAndServeTLS(h.tlsConfig.CertPath, h.tlsConfig.KeyPath)
+	}
+
+	return server.ListenAndServe()
+}
+
+func (h *HTTPService) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (h *HTTPService) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if h.store == nil {
+		h.writeError(w, http.StatusServiceUnavailable, "store is not initialized")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+type CreateLogicalVolumeRequest struct {
+	LogicalVolumeID string `json:"logical_volume_id"`
+}
+
+func (h *HTTPService) handleCreateLogicalVolume(w http.ResponseWriter, r *http.Request) {
+	var req CreateLogicalVolumeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid json payload")
+		return
+	}
+
+	err := h.store.NewLogical(req.LogicalVolumeID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "error creating logical volume")
+		return
+	}
+
+	h.writeMsg(w, fmt.Sprintf("successfully created logical volume: %s", req.LogicalVolumeID))
+}
+
+func (h *HTTPService) handleCreateFile(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("file_id")
+	if fileID == "" {
+		h.writeError(w, http.StatusBadRequest, "file_id is not provided in path")
+		return
+	}
+
+	logicalID := r.PathValue("logical_id")
+	if fileID == "" {
+		h.writeError(w, http.StatusBadRequest, "file_id is not provided in path")
+		return
+	}
+
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "cannot read request body")
+		return
+	}
+	r.Body.Close()
+
+	err = h.store.CreateFile(fileID, logicalID, b)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, fmt.Sprintf("error writing file: %s", err))
+		return
+	}
+
+	h.writeMsg(w, "successfully wrote file")
+}
+
+func (h *HTTPService) handleReadFile(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("file_id")
+	if fileID == "" {
+		h.writeError(w, http.StatusBadRequest, "file_id is not provided in path")
+		return
+	}
+
+	logicalID := r.PathValue("logical_id")
+	if logicalID == "" {
+		h.writeError(w, http.StatusBadRequest, "logical_id is not provided in path")
+		return
+	}
+
+	data, err := h.store.ReadFile(fileID, logicalID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, fmt.Sprintf("error reading file: %s", err))
+		return
+	}
+
+	w.Write(data)
+	w.WriteHeader(http.StatusOK)
+}
+
+type LogicalVolumeInfo struct {
+	ID   string `json:"id"`
+	Size int64  `json:"size"`
+}
+
+func (h *HTTPService) handleGetLogicals(w http.ResponseWriter, _ *http.Request) {
+	volumes := make([]LogicalVolumeInfo, 0, len(h.store.logicals))
+	for id, file := range h.store.logicals {
+		size, err := file.Size()
+		if err != nil {
+			h.writeError(w, http.StatusInternalServerError, fmt.Sprintf("error reading file length: %s", err))
+			return
+		}
+
+		volumes = append(volumes, LogicalVolumeInfo{
+			ID:   id,
+			Size: size,
+		})
+	}
+
+	json.NewEncoder(w).Encode(&volumes)
+}
